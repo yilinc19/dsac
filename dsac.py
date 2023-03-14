@@ -96,6 +96,7 @@ def experiment(variant):
     )
     trainer = DSACTrainer(
         env=dummy_env,
+        self.alg,
         policy=policy,
         target_policy=target_policy,
         zf1=zf1,
@@ -109,6 +110,7 @@ def experiment(variant):
     )
     algorithm = TorchVecOnlineRLAlgorithm(
         trainer=trainer,
+        self.alg,
         exploration_env=expl_env,
         evaluation_env=eval_env,
         exploration_data_collector=expl_path_collector,
@@ -118,6 +120,7 @@ def experiment(variant):
     )
     algorithm.to(ptu.device)
     algorithm.train()
+    algorithm.test()
 
 
 if __name__ == "__main__":
@@ -125,6 +128,8 @@ if __name__ == "__main__":
     parser.add_argument('--config', type=str, default="configs/lunarlander.yaml")
     parser.add_argument('--gpu', type=int, default=0, help="using cpu with -1")
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--alg', type=int, default=0)
+    self.alg = args.alg
     args = parser.parse_args()
     with open(args.config, 'r', encoding="utf-8") as f:
         variant = yaml.load(f, Loader=yaml.FullLoader)
