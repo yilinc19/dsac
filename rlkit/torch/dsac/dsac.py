@@ -10,7 +10,6 @@ import rlkit.torch.pytorch_util as ptu
 from rlkit.core.eval_util import create_stats_ordered_dict
 from rlkit.torch.torch_rl_algorithm import TorchTrainer
 
-from .risk import distortion_de
 from .utils import LinearSchedule
 
 
@@ -36,6 +35,7 @@ class DSACTrainer(TorchTrainer):
     def __init__(
             self,
             env,
+            alg,
             policy,
             target_policy,
             zf1,
@@ -49,6 +49,7 @@ class DSACTrainer(TorchTrainer):
             alpha=1.0,
             policy_lr=3e-4,
             zf_lr=3e-4,
+            lambda_lr=3e-6,
             tau_type='iqn',
             fp_lr=1e-5,
             num_quantiles=32,
@@ -64,6 +65,7 @@ class DSACTrainer(TorchTrainer):
             target_entropy=None,
     ):
         super().__init__()
+        self.alg = alg
         self.env = env
         self.policy = policy
         self.target_policy = target_policy
@@ -71,6 +73,9 @@ class DSACTrainer(TorchTrainer):
         self.zf2 = zf2
         self.target_zf1 = target_zf1
         self.target_zf2 = target_zf2
+        self.lambda_value = 0
+        self.history = []
+        self.lambda_lr = lambda_lr
 
         self.soft_target_tau = soft_target_tau
         self.target_update_period = target_update_period
@@ -97,6 +102,7 @@ class DSACTrainer(TorchTrainer):
             self.policy.parameters(),
             lr=policy_lr,
         )
+
 
         self.zf1_optimizer = optimizer_class(
             self.zf1.parameters(),
@@ -238,12 +244,35 @@ class DSACTrainer(TorchTrainer):
                     q2_new_actions -= risk_param * q2_std.sum(dim=1, keepdims=True).sqrt()
             else:
                 with torch.no_grad():
-                    risk_weights = distortion_de(new_tau_hat, self.risk_type, risk_param)
+                    risk_weights = self.cvar(new_tau_hat, risk_param)
                 q1_new_actions = torch.sum(risk_weights * new_presum_tau * z1_new_actions, dim=1, keepdims=True)
                 q2_new_actions = torch.sum(risk_weights * new_presum_tau * z2_new_actions, dim=1, keepdims=True)
-        q_new_actions = torch.min(q1_new_actions, q2_new_actions)
 
-        policy_loss = (alpha * log_pi - q_new_actions).mean()
+        q_new_actions = torch.min(q1_new_actions, q2_new_actions)
+        q_new_actions_2 = self.add_100(q_new_actions)
+        ave = float(sum(list(q_new_actions_2)) / len(list(q_new_actions_2)))
+        self.history.append(ave)
+        if len(self.history) > 3000:
+          self.history.pop(0)
+        cv = self.get_cvar(self.history, risk_param)
+        #self.lambda_value += self.lambda_lr * cv
+        self.lambda_value = self.lambda_lr * cv
+
+        
+        #self.lambda_optimizer.zero_grad()
+        #lambda_loss.backward()
+        #self.lambda_optimizer.step()
+        #gt.stamp('backward_lambda', unique=False)
+        p_loss = (alpha * log_pi - q_new_actions)
+        if (self.alg == 0):
+            policy_loss = (p_loss + self.lambda_value * p_loss).mean()
+        else:
+            policy_loss = p_loss.mean()
+        #print (float(p_loss.mean()))
+        #print (self.lambda_value)
+        #print (float(policy_loss))
+        #print ("=======================")
+        
         gt.stamp('preback_policy', unique=False)
 
         self.policy_optimizer.zero_grad()
@@ -251,6 +280,8 @@ class DSACTrainer(TorchTrainer):
         policy_grad = ptu.fast_clip_grad_norm(self.policy.parameters(), self.clip_norm)
         self.policy_optimizer.step()
         gt.stamp('backward_policy', unique=False)
+
+
         """
         Soft Updates
         """
@@ -307,6 +338,68 @@ class DSACTrainer(TorchTrainer):
 
     def get_diagnostics(self):
         return self.eval_statistics
+    
+    def get_len(self):
+        return len(self.history)
+
+    def get_cvar(self, lis, risk_param):
+        lis.sort()
+        length = int(len(lis)*risk_param)
+        if (length == 0):
+          return 0
+        else:
+          newlis = lis[:length]
+          return (sum(newlis) / len(newlis))
+
+    def Cvar(self, original_tau, risk_param):
+        length = len(original_tau[0])
+        new_length = int(risk_param / 4)
+        if new_length < 1:
+            new_length = 1
+        x = []
+        for a1 in range (len(original_tau)):
+            y = list(map(lambda x: float(x), original_tau[a1]))
+            y.sort()
+            x.append(sum(y[:new_length]) / new_length)
+        device = torch.device('cuda')
+        cpu_tensor = torch.Tensor(x)
+        #gpu_tensor = cpu_tensor.to(device)
+        return cpu_tensor
+
+    def cvar(self, new_tau_hat, risk_param):
+        changed_tau = new_tau_hat.clamp(0., 1.)
+        if risk_param >= 0:
+            risk_weights = (1. / risk_param) * (changed_tau < risk_param)
+        else:
+            risk_weights = (1. / (-risk_param)) * ((1 - changed_tau) < (-risk_param))
+        return risk_weights
+
+    def add_100(self, tor):
+      x = []
+      for i in tor:
+        x.append(float(i) + 100)
+      device = torch.device('cuda')
+      cpu_tensor = torch.Tensor(x)
+      #gpu_tensor = cpu_tensor.to(device)
+      return cpu_tensor
+      
+    
+    def add_list(self, a, b):
+        if a == None:
+            return b
+        x = []
+        for a1 in range(int(len(a))):
+            if len(list(a[a1])) < 10:
+                x.append(list(a[a1]) + list(b[a1]))
+            else:
+                x.append(list(a[a1])[1:] + list(b[a1]))
+        device = torch.device('cuda')
+        cpu_tensor = torch.Tensor(x)
+        #gpu_tensor = cpu_tensor.to(device)
+        return cpu_tensor
+
+    def clear_history(self):
+        self.history = []
 
     def end_epoch(self, epoch):
         self._need_to_update_eval_statistics = True
